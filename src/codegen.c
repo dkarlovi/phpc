@@ -75,6 +75,39 @@ static void cv_store(cg_t *cg, uint32_t idx, LLVMValueRef val)
     LLVMBuildStore(cg->bldr, val, cg->cv[idx]);
 }
 
+/* Load either a CV, a temp, or an inline integer constant into an i64. */
+static LLVMValueRef load_operand(cg_t *cg, const zend_op *op,
+                                 const znode_op *node, uint8_t type)
+{
+    switch (clean_type(type)) {
+        case IS_CV:
+            return cv_load(cg, slot_of(node->var));
+        case IS_TMP_VAR:
+        case IS_VAR:
+            return cg->temps[slot_of(node->var)];
+        case IS_CONST: {
+            const zval *z = RT_CONSTANT(op, *node);
+            return LLVMConstInt(cg->i64_t, (long long)Z_LVAL_P(z), 1);
+        }
+        default:
+            return LLVMConstInt(cg->i64_t, 0, 0);
+    }
+}
+
+/* Emit an integer comparison, storing the i64 boolean result in a temp. */
+static void emit_icmp(cg_t *cg, const zend_op *op,
+                      LLVMIntPredicate pred, const char *name)
+{
+    uint32_t res = slot_of(op->result.var);
+    LLVMValueRef lhs = load_operand(cg, op, &op->op1, op->op1_type);
+    LLVMValueRef rhs = load_operand(cg, op, &op->op2, op->op2_type);
+    char zname[32], iname[32];
+    snprintf(zname, sizeof(zname), "%s", name);
+    snprintf(iname, sizeof(iname), "%s_i64", name);
+    LLVMValueRef cmp = LLVMBuildICmp(cg->bldr, pred, lhs, rhs, zname);
+    cg->temps[res] = LLVMBuildZExt(cg->bldr, cmp, cg->i64_t, iname);
+}
+
 /* ──────────────────────────────────────────────────────────
  * Declare external libc helpers
  * ────────────────────────────────────────────────────────── */
@@ -251,13 +284,30 @@ static void emit_ops(cg_t *cg, const zend_op_array *oa)
 
         /* ── $cv = value ─────────────────────────────────── */
         case ZEND_ASSIGN: {
-            /* op1 = CV target, op2 = source (IS_CONST only for PoC) */
             uint32_t cv_idx = slot_of(op->op1.var);
-            if (clean_type(op->op2_type) == IS_CONST) {
-                const zval *z = RT_CONSTANT(op, op->op2);
-                LLVMValueRef val = LLVMConstInt(cg->i64_t, (long long)Z_LVAL_P(z), 1);
-                cv_store(cg, cv_idx, val);
+            switch (clean_type(op->op2_type)) {
+                case IS_CONST: {
+                    const zval *z = RT_CONSTANT(op, op->op2);
+                    cv_store(cg, cv_idx, LLVMConstInt(cg->i64_t, (long long)Z_LVAL_P(z), 1));
+                    break;
+                }
+                case IS_TMP_VAR:
+                case IS_VAR:
+                    cv_store(cg, cv_idx, cg->temps[slot_of(op->op2.var)]);
+                    break;
+                case IS_CV:
+                    cv_store(cg, cv_idx, cv_load(cg, slot_of(op->op2.var)));
+                    break;
             }
+            break;
+        }
+
+        /* ── T = lhs + rhs ───────────────────────────────── */
+        case ZEND_ADD: {
+            uint32_t res = slot_of(op->result.var);
+            LLVMValueRef lhs = load_operand(cg, op, &op->op1, op->op1_type);
+            LLVMValueRef rhs = load_operand(cg, op, &op->op2, op->op2_type);
+            cg->temps[res] = LLVMBuildAdd(cg->bldr, lhs, rhs, "add");
             break;
         }
 
@@ -272,33 +322,12 @@ static void emit_ops(cg_t *cg, const zend_op_array *oa)
             break;
         }
 
-        /* ── T = T|CV == CONST ───────────────────────────── */
-        case ZEND_IS_EQUAL: {
-            uint32_t res  = slot_of(op->result.var);
-            uint32_t lslot = slot_of(op->op1.var);
-            LLVMValueRef lhs = cg->temps[lslot];
-            const zval *z = RT_CONSTANT(op, op->op2);
-            LLVMValueRef rhs = LLVMConstInt(cg->i64_t, (long long)Z_LVAL_P(z), 1);
-            LLVMValueRef cmp = LLVMBuildICmp(cg->bldr, LLVMIntEQ, lhs, rhs, "eq");
-            cg->temps[res] = LLVMBuildZExt(cg->bldr, cmp, cg->i64_t, "eq_i64");
-            break;
-        }
-
-        /* ── T = $cv < CONST ─────────────────────────────── */
-        case ZEND_IS_SMALLER: {
-            uint32_t res = slot_of(op->result.var);
-            LLVMValueRef lhs;
-            if (clean_type(op->op1_type) == IS_CV) {
-                lhs = cv_load(cg, slot_of(op->op1.var));
-            } else {
-                lhs = cg->temps[slot_of(op->op1.var)];
-            }
-            const zval *z = RT_CONSTANT(op, op->op2);
-            LLVMValueRef rhs = LLVMConstInt(cg->i64_t, (long long)Z_LVAL_P(z), 1);
-            LLVMValueRef cmp = LLVMBuildICmp(cg->bldr, LLVMIntSLT, lhs, rhs, "slt");
-            cg->temps[res] = LLVMBuildZExt(cg->bldr, cmp, cg->i64_t, "slt_i64");
-            break;
-        }
+        case ZEND_IS_EQUAL:            emit_icmp(cg, op, LLVMIntEQ,  "eq");  break;
+        case ZEND_IS_NOT_EQUAL:        emit_icmp(cg, op, LLVMIntNE,  "ne");  break;
+        case ZEND_IS_IDENTICAL:        emit_icmp(cg, op, LLVMIntEQ,  "id");  break;
+        case ZEND_IS_NOT_IDENTICAL:    emit_icmp(cg, op, LLVMIntNE,  "nid"); break;
+        case ZEND_IS_SMALLER:          emit_icmp(cg, op, LLVMIntSLT, "slt"); break;
+        case ZEND_IS_SMALLER_OR_EQUAL: emit_icmp(cg, op, LLVMIntSLE, "sle"); break;
 
         /* ── unconditional jump ──────────────────────────── */
         case ZEND_JMP: {
@@ -401,8 +430,18 @@ static void emit_ops(cg_t *cg, const zend_op_array *oa)
         }
         case ZEND_SEND_VAL: {
             if (g_n_send_args < 16) {
-                uint32_t slot = slot_of(op->op1.var);
-                g_send_args[g_n_send_args++] = cg->temps[slot];
+                LLVMValueRef arg;
+                if (clean_type(op->op1_type) == IS_CONST) {
+                    const zval *z = RT_CONSTANT(op, op->op1);
+                    if (Z_TYPE_P(z) == IS_STRING) {
+                        arg = LLVMBuildGlobalStringPtr(cg->bldr, Z_STRVAL_P(z), ".str");
+                    } else {
+                        arg = LLVMConstInt(cg->i64_t, (long long)Z_LVAL_P(z), 1);
+                    }
+                } else {
+                    arg = cg->temps[slot_of(op->op1.var)];
+                }
+                g_send_args[g_n_send_args++] = arg;
             }
             break;
         }

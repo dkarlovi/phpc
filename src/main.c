@@ -42,7 +42,14 @@ static int run(const char *php_file)
 
     rc = codegen(main_oa, "output.o");
     if (rc == 0) {
-        puts("\nphpc: emitted output.o — run: clang output.o -o a.out && ./a.out");
+        fputs("\nphpc: linking...\n", stderr);
+        int link_rc = system("clang output.o -o a.out");
+        if (link_rc != 0) {
+            fprintf(stderr, "phpc: link failed (exit %d)\n", link_rc);
+            rc = 1;
+        } else {
+            fputs("phpc: done — ./a.out\n", stderr);
+        }
     }
 
     destroy_op_array(main_oa);
